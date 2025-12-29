@@ -8,7 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 from scipy.stats import spearmanr, pearsonr
 import matplotlib.pyplot as plt
 import seaborn as sns
-import wandb
+import trackio as wandb
 
 from make_envs import make_env
 from agent import make_agent

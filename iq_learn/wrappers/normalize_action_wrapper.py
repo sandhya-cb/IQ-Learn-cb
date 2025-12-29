@@ -14,9 +14,8 @@
 # limitations under the License.
 
 """Wrapper to normalize gym.spaces.Box actions in [-1, 1]."""
-
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
 
 

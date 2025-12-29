@@ -11,6 +11,7 @@ from wrappers.atari_wrapper import LazyFrames
 
 class SoftQ(object):
     def __init__(self, num_inputs, action_dim, batch_size, args):
+        print("SoftQ args:", args)
         self.gamma = args.gamma
         self.batch_size = batch_size
         self.device = torch.device(args.device)

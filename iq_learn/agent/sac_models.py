@@ -5,211 +5,198 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from torch import distributions as pyd
 from torch.autograd import Variable, grad
+from omegaconf import ListConfig, DictConfig
+import torchvision.models as models
+# from pytorch_grad_cam import EigenCAM # Optional
 
-import utils.utils as utils
+try:
+    import utils.utils as utils
+except ImportError:
+    pass 
 
-# Initialize Policy weights
+# --- HELPER FUNCTIONS ---
+def to_list(x):
+    if isinstance(x, (ListConfig, tuple)):
+        return list(x)
+    return x
+
+def is_image(obs_dim):
+    if hasattr(obs_dim, '__len__') and len(obs_dim) == 3:
+        return True
+    return False
+
 def orthogonal_init_(m):
-    """Custom weight init for Conv2D and Linear layers."""
     if isinstance(m, nn.Linear):
         nn.init.orthogonal_(m.weight.data)
         if hasattr(m.bias, 'data'):
             m.bias.data.fill_(0.0)
+    elif isinstance(m, nn.Conv2d):
+        nn.init.orthogonal_(m.weight.data, gain=nn.init.calculate_gain('relu'))
+        if hasattr(m.bias, 'data'):
+            m.bias.data.fill_(0.0)
 
+# --- ENCODERS ---
+class MultiModalEncoder(nn.Module):
+    def __init__(self, obs_shape, feature_dim=256, pretrained=True):
+        super().__init__()
+        # print("Multimodal encoder class")
+        weights = 'DEFAULT' if pretrained else None
+        self.resnet = models.resnet18(weights=weights)
+        self.resnet.fc = nn.Identity() 
+        self.resnet_out_dim = 512
 
+        # print("State encoder")
+        self.state_dim = obs_shape['state'][0]
+        self.state_embed_dim = 64
+        self.state_mlp = nn.Sequential(
+            nn.Linear(self.state_dim, self.state_embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.state_embed_dim, self.state_embed_dim),
+            nn.ReLU()
+        )
+
+        fusion_input_dim = self.resnet_out_dim + self.state_embed_dim
+        self.fusion_fc = nn.Linear(fusion_input_dim, feature_dim)
+        self.ln = nn.LayerNorm(feature_dim)
+        self.feature_dim = feature_dim
+
+        if not pretrained:
+            self.apply(orthogonal_init_)
+
+    def forward(self, obs):
+        if isinstance(obs, dict):
+            img = obs['image']
+            state = obs['state']
+        else:
+            img = obs
+            state = torch.zeros((img.shape[0], self.state_dim), device=img.device)
+
+        if img.max() > 1.0: img = img / 255.0
+        img_embed = self.resnet(img)
+        state_embed = self.state_mlp(state)
+        fused = torch.cat([img_embed, state_embed], dim=1)
+        out = self.fusion_fc(fused)
+        out = self.ln(out)
+        return torch.tanh(out)
+
+class PixelEncoder(nn.Module):
+    def __init__(self, obs_shape, feature_dim=50, pretrained=True):
+        super().__init__()
+        self.feature_dim = feature_dim
+        obs_shape = to_list(obs_shape)
+        weights = 'DEFAULT' 
+        self.resnet = models.resnet18(weights=weights)
+        
+        input_channels = obs_shape[0]
+        if input_channels != 3:
+            self.resnet.conv1 = nn.Conv2d(
+                input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
+
+        num_ftrs = self.resnet.fc.in_features
+        self.resnet.fc = nn.Linear(num_ftrs, self.feature_dim)
+        self.ln = nn.LayerNorm(self.feature_dim)
+        
+        if not pretrained:
+            self.apply(orthogonal_init_)
+
+    def forward(self, obs):
+        if obs.max() > 1.0:
+            obs = obs / 255.0
+        h = self.resnet(obs)
+        h = self.ln(h)
+        return torch.tanh(h)
+
+# --- CRITIC ---
 class DoubleQCritic(nn.Module):
     def __init__(self, obs_dim, action_dim, hidden_dim, hidden_depth, args):
         super(DoubleQCritic, self).__init__()
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
         self.args = args
 
-        # Q1 architecture
-        self.Q1 = utils.mlp(obs_dim + action_dim, hidden_dim, 1, hidden_depth)
+        is_multimodal = isinstance(obs_dim, (dict, DictConfig)) or (hasattr(obs_dim, 'keys'))
+        is_img_list = is_image(obs_dim)
 
-        # Q2 architecture
-        self.Q2 = utils.mlp(obs_dim + action_dim, hidden_dim, 1, hidden_depth)
+        self.encoder = None
+        
+        if is_multimodal:
+            self.encoder = MultiModalEncoder(obs_dim, feature_dim=hidden_dim)
+            input_dim = self.encoder.feature_dim + action_dim
+        elif is_img_list:
+            self.encoder = PixelEncoder(obs_dim, feature_dim=hidden_dim)
+            input_dim = self.encoder.feature_dim + action_dim
+        else:
+            if obs_dim is None:
+                raise ValueError("obs_dim is None! Check your Hydra config.")
+            dim_val = obs_dim[0] if hasattr(obs_dim, '__len__') else obs_dim
+            input_dim = dim_val + action_dim
 
+        self.Q1 = utils.mlp(input_dim, hidden_dim, 1, hidden_depth)
+        self.Q2 = utils.mlp(input_dim, hidden_dim, 1, hidden_depth)
         self.apply(orthogonal_init_)
 
     def forward(self, obs, action, both=False):
-        assert obs.size(0) == action.size(0)
-
+        if self.encoder is not None:
+            obs = self.encoder(obs)
         obs_action = torch.cat([obs, action], dim=-1)
         q1 = self.Q1(obs_action)
         q2 = self.Q2(obs_action)
-
         if self.args.method.tanh:
             q1 = torch.tanh(q1) * 1/(1-self.args.gamma)
             q2 = torch.tanh(q2) * 1/(1-self.args.gamma)
-
         if both:
             return q1, q2
+        return torch.min(q1, q2)
+
+# --- ACTOR ---
+class DiagGaussianActor(nn.Module):
+    def __init__(self, obs_dim, action_dim, hidden_dim, hidden_depth, log_std_bounds):
+        super().__init__()
+        self.log_std_bounds = log_std_bounds
+
+        # 1. Determine Input Type
+        is_multimodal = isinstance(obs_dim, (dict, DictConfig)) or (hasattr(obs_dim, 'keys'))
+        is_img_list = is_image(obs_dim) 
+
+        self.encoder = None
+        
+        if is_multimodal:
+            # Case A: Dictionary (Fusion)
+            self.encoder = MultiModalEncoder(obs_dim, feature_dim=hidden_dim)
+            input_dim = self.encoder.feature_dim
+        elif is_img_list:
+            # Case B: Standard Image List (Pixel)
+            self.encoder = PixelEncoder(obs_dim, feature_dim=hidden_dim)
+            input_dim = self.encoder.feature_dim
         else:
-            return torch.min(q1, q2)
+            # Case C: Standard Vector
+            dim_val = obs_dim[0] if hasattr(obs_dim, '__len__') else obs_dim
+            input_dim = dim_val
 
-    def grad_pen(self, obs1, action1, obs2, action2, lambda_=1):
-        expert_data = torch.cat([obs1, action1], 1)
-        policy_data = torch.cat([obs2, action2], 1)
-
-        alpha = torch.rand(expert_data.size()[0], 1)
-        alpha = alpha.expand_as(expert_data).to(expert_data.device)
-
-        interpolated = alpha * expert_data + (1 - alpha) * policy_data
-        interpolated = Variable(interpolated, requires_grad=True)
-
-        interpolated_state, interpolated_action = torch.split(
-            interpolated, [self.obs_dim, self.action_dim], dim=1)
-        q = self.forward(interpolated_state, interpolated_action, both=True)
-        ones = torch.ones(q[0].size()).to(policy_data.device)
-        gradient = grad(
-            outputs=q,
-            inputs=interpolated,
-            grad_outputs=[ones, ones],
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-        grad_pen = lambda_ * (gradient.norm(2, dim=1) - 1).pow(2).mean()
-        return grad_pen
-
-
-class DoubleQCriticMax(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim, hidden_depth, args):
-        super(DoubleQCriticMax, self).__init__()
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
-        self.args = args
-
-        # Q1 architecture
-        self.Q1 = utils.mlp(obs_dim + action_dim, hidden_dim, 1, hidden_depth)
-
-        # Q2 architecture
-        self.Q2 = utils.mlp(obs_dim + action_dim, hidden_dim, 1, hidden_depth)
-
+        self.trunk = utils.mlp(input_dim, hidden_dim, 2 * action_dim, hidden_depth)
+        self.outputs = dict()
         self.apply(orthogonal_init_)
 
-    def forward(self, obs, action, both=False):
-        assert obs.size(0) == action.size(0)
+    def forward(self, obs):
+        if self.encoder is not None:
+            obs = self.encoder(obs)
 
-        obs_action = torch.cat([obs, action], dim=-1)
-        q1 = self.Q1(obs_action)
-        q2 = self.Q2(obs_action)
+        mu, log_std = self.trunk(obs).chunk(2, dim=-1)
 
-        if self.args.method.tanh:
-            q1 = torch.tanh(q1) * 1/(1-self.args.gamma)
-            q2 = torch.tanh(q2) * 1/(1-self.args.gamma)
+        log_std = torch.tanh(log_std)
+        log_std_min, log_std_max = self.log_std_bounds
+        log_std = log_std_min + 0.5 * (log_std_max - log_std_min) * (log_std + 1)
+        std = log_std.exp()
 
-        if both:
-            return q1, q2
-        else:
-            return torch.max(q1, q2)
+        dist = SquashedNormal(mu, std)
+        return dist
 
+    def sample(self, obs):
+        dist = self.forward(obs)
+        action = dist.rsample()
+        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
+        return action, log_prob, dist.mean
 
-class SingleQCritic(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim, hidden_depth, args):
-        super(SingleQCritic, self).__init__()
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
-        self.args = args
-
-        # Q architecture
-        self.Q = utils.mlp(obs_dim + action_dim, hidden_dim, 1, hidden_depth)
-
-        self.apply(orthogonal_init_)
-
-    def forward(self, obs, action):
-        assert obs.size(0) == action.size(0)
-
-        obs_action = torch.cat([obs, action], dim=-1)
-        q = self.Q(obs_action)
-
-        if self.args.method.tanh:
-            q = torch.tanh(q) * 1/(1-self.args.gamma)
-
-        return q
-
-    def grad_pen(self, obs1, action1, obs2, action2, lambda_=1):
-        expert_data = torch.cat([obs1, action1], 1)
-        policy_data = torch.cat([obs2, action2], 1)
-
-        alpha = torch.rand(expert_data.size()[0], 1)
-        alpha = alpha.expand_as(expert_data).to(expert_data.device)
-
-        interpolated = alpha * expert_data + (1 - alpha) * policy_data
-        interpolated = Variable(interpolated, requires_grad=True)
-
-        interpolated_state, interpolated_action = torch.split(
-            interpolated, [self.obs_dim, self.action_dim], dim=1)
-        q = self.forward(interpolated_state, interpolated_action)
-        ones = torch.ones(q.size()).to(policy_data.device)
-        gradient = grad(
-            outputs=q,
-            inputs=interpolated,
-            grad_outputs=ones,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-        grad_pen = lambda_ * (gradient.norm(2, dim=1) - 1).pow(2).mean()
-        return grad_pen
-
-
-class DoubleQCriticState(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim, hidden_depth, args):
-        super(DoubleQCritic, self).__init__()
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
-        self.args = args
-
-        # Q1 architecture
-        self.Q1 = utils.mlp(obs_dim, hidden_dim, 1, hidden_depth)
-
-        # Q2 architecture
-        self.Q2 = utils.mlp(obs_dim, hidden_dim, 1, hidden_depth)
-
-        self.apply(orthogonal_init_)
-
-    def forward(self, obs, action, both=False):
-        assert obs.size(0) == action.size(0)
-
-        q1 = self.Q1(obs)
-        q2 = self.Q2(obs)
-
-        if self.args.method.tanh:
-            q1 = torch.tanh(q1) * 1/(1-self.args.gamma)
-            q2 = torch.tanh(q2) * 1/(1-self.args.gamma)
-
-        if both:
-            return q1, q2
-        else:
-            return torch.min(q1, q2)
-
-    def grad_pen(self, obs1, action1, obs2, action2, lambda_=1):
-        expert_data = obs1
-        policy_data = obs2
-
-        alpha = torch.rand(expert_data.size()[0], 1)
-        alpha = alpha.expand_as(expert_data).to(expert_data.device)
-
-        interpolated = alpha * expert_data + (1 - alpha) * policy_data
-        interpolated = Variable(interpolated, requires_grad=True)
-
-        interpolated_state, interpolated_action = torch.split(
-            interpolated, [self.obs_dim, self.action_dim], dim=1)
-        q = self.forward(interpolated_state, interpolated_action)
-        ones = torch.ones(q[0].size()).to(policy_data.device)
-        gradient = grad(
-            outputs=q,
-            inputs=interpolated,
-            grad_outputs=[ones, ones],
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
-        grad_pen = lambda_ * (gradient.norm(2, dim=1) - 1).pow(2).mean()
-        return grad_pen
-
+# --- DISTRIBUTIONS ---
 class TanhTransform(pyd.transforms.Transform):
     domain = pyd.constraints.real
     codomain = pyd.constraints.interval(-1.0, 1.0)
@@ -255,41 +242,3 @@ class SquashedNormal(pyd.transformed_distribution.TransformedDistribution):
         for tr in self.transforms:
             mu = tr(mu)
         return mu
-
-
-class DiagGaussianActor(nn.Module):
-    """torch.distributions implementation of an diagonal Gaussian policy."""
-
-    def __init__(self, obs_dim, action_dim, hidden_dim, hidden_depth,
-                 log_std_bounds):
-        super().__init__()
-
-        self.log_std_bounds = log_std_bounds
-        self.trunk = utils.mlp(obs_dim, hidden_dim, 2 * action_dim,
-                               hidden_depth)
-
-        self.outputs = dict()
-        self.apply(orthogonal_init_)
-
-    def forward(self, obs):
-        mu, log_std = self.trunk(obs).chunk(2, dim=-1)
-
-        # constrain log_std inside [log_std_min, log_std_max]
-        log_std = torch.tanh(log_std)
-        log_std_min, log_std_max = self.log_std_bounds
-        log_std = log_std_min + 0.5 * (log_std_max - log_std_min) * (log_std + 1)
-
-        std = log_std.exp()
-
-        # self.outputs['mu'] = mu
-        # self.outputs['std'] = std
-
-        dist = SquashedNormal(mu, std)
-        return dist
-
-    def sample(self, obs):
-        dist = self.forward(obs)
-        action = dist.rsample()
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
-
-        return action, log_prob, dist.mean

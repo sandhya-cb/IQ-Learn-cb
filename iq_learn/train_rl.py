@@ -10,7 +10,7 @@ import hydra
 import numpy as np
 import torch
 import torch.nn.functional as F
-import wandb
+import trackio as wandb
 from omegaconf import DictConfig, OmegaConf
 from tensorboardX import SummaryWriter
 

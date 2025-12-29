@@ -1,7 +1,7 @@
 from omegaconf import DictConfig, OmegaConf
 import torch
 import hydra
-import gym
+import gymnasium as gym
 from itertools import count
 import numpy as np
 import seaborn as sns
@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import pickle
 import matplotlib
 import os
-import wandb
+import trackio as wandb
 
 from utils.utils import evaluate
 from agent import make_agent

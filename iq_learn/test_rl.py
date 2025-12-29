@@ -1,6 +1,6 @@
 from itertools import count
 import torch
-import gym
+import gymnasium as gym
 import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf

@@ -3,6 +3,7 @@
 agent:
   name: sac
   _target_: agent.sac.SAC
+  _recursive_: false
   obs_dim: ??? # to be specified later
   action_dim: ??? # to be specified later
 
@@ -30,14 +31,19 @@ agent:
 
 q_net:
   _target_: agent.sac_models.DoubleQCritic
-  obs_dim: ${agent.obs_dim}
+  obs_dim:
+    image: [3, 84, 84]
+    state: [4]
   action_dim: ${agent.action_dim}
   hidden_dim: 256
   hidden_depth: 2
+  args: {}
 
 diag_gaussian_actor:
   _target_: agent.sac_models.DiagGaussianActor
-  obs_dim: ${agent.obs_dim}
+  obs_dim:
+    image: [3, 84, 84]
+    state: [4]
   action_dim: ${agent.action_dim}
   hidden_dim: 256
   hidden_depth: 2

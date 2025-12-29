@@ -16,7 +16,7 @@ import hydra
 import numpy as np
 import torch
 import torch.nn.functional as F
-import wandb
+import trackio as wandb
 from omegaconf import DictConfig, OmegaConf
 from tensorboardX import SummaryWriter
 
@@ -41,8 +41,8 @@ def get_args(cfg: DictConfig):
 @hydra.main(config_path="conf", config_name="config")
 def main(cfg: DictConfig):
     args = get_args(cfg)
-    wandb.init(project=args.project_name, entity='iq-learn',
-               sync_tensorboard=True, reinit=True, config=args)
+    wandb.init(project=args.project_name) #entity='iq-learn',
+              # sync_tensorboard=True, reinit=True, config=args)
 
     # set seeds
     random.seed(args.seed)
@@ -59,8 +59,8 @@ def main(cfg: DictConfig):
     eval_env = make_env(args)
 
     # Seed envs
-    env.seed(args.seed)
-    eval_env.seed(args.seed + 10)
+    # env.seed(args.seed)
+    # eval_env.seed(args.seed + 10)
 
     REPLAY_MEMORY = int(env_args.replay_mem)
     INITIAL_MEMORY = int(env_args.initial_mem)
@@ -112,26 +112,34 @@ def main(cfg: DictConfig):
     episode_reward = 0
 
     # Sample initial states from env
-    state_0 = [env.reset()] * INITIAL_STATES
-    if isinstance(state_0[0], LazyFrames):
-        state_0 = np.array(state_0) / 255.0
-    state_0 = torch.FloatTensor(np.array(state_0)).to(args.device)
+    # state_0 = [env.reset()] * INITIAL_STATES
+    # if isinstance(state_0[0], LazyFrames):
+    #     state_0 = np.array(state_0) / 255.0
+    # state_0 = torch.FloatTensor(np.array(state_0)).to(args.device)
 
-    for epoch in count():
-        state = env.reset()
+    
+    for epoch in count(): # n of episodes
+        state, info = env.reset() 
         episode_reward = 0
         done = False
 
         start_time = time.time()
-        for episode_step in range(EPISODE_STEPS):
-
+        for episode_step in range(EPISODE_STEPS): # n of steps
             if steps < args.num_seed_steps:
                 # Seed replay buffer with random actions
                 action = env.action_space.sample()
             else:
                 with eval_mode(agent):
-                    action = agent.choose_action(state, sample=True)
-            next_state, reward, done, _ = env.step(action)
+                    action = agent.choose_action(state, sample=True) 
+            next_state, reward, terminated, truncated, info = env.step(action)
+
+            # 2. Combine them to create the actual 'done' flag
+            done = terminated or truncated
+
+            # 3. Handle the reset logic immediately
+            if done:
+                # Reset returns a tuple now too!
+                next_state, _ = env.reset()
             episode_reward += reward
             steps += 1
 
@@ -147,14 +155,16 @@ def main(cfg: DictConfig):
                 if returns > best_eval_returns:
                     # Store best eval returns
                     best_eval_returns = returns
-                    wandb.run.summary["best_returns"] = best_eval_returns
+                    # if wandb.run:
+                    #     wandb.run.summary["best_returns"] = best_eval_returns
                     save(agent, epoch, args, output_dir='results_best')
 
             # only store done true when episode finishes without hitting timelimit (allow infinite bootstrap)
             done_no_lim = done
             if str(env.__class__.__name__).find('TimeLimit') >= 0 and episode_step + 1 == env._max_episode_steps:
                 done_no_lim = 0
-            online_memory_replay.add((state, next_state, action, reward, done_no_lim))
+            if type(state) == np.ndarray:
+                online_memory_replay.add((state, next_state, action, reward, done_no_lim))
 
             if online_memory_replay.size() > INITIAL_MEMORY:
                 # Start learning
@@ -192,6 +202,13 @@ def main(cfg: DictConfig):
         # print('TRAIN\tEp {}\tAverage reward: {:.2f}\t'.format(epoch, np.mean(rewards_window)))
         save(agent, epoch, args, output_dir='results')
 
+    save_path = "q_network_final.pth"
+
+    # 2. Save the state dictionary of the underlying Q-network
+    # agent is your SoftQ instance, q_net is the actual neural network
+    torch.save(agent.q_net.state_dict(), save_path)
+
+    print(f"✅ Q-function saved to {save_path}")
 
 def save(agent, epoch, args, output_dir='results'):
     if epoch % args.save_interval == 0:

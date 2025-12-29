@@ -1,10 +1,11 @@
-import gym
+import gymnasium as gym
 from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.monitor import Monitor
 
 from wrappers.atari_wrapper import ScaledFloatFrame, FrameStack, FrameStackEager, PyTorchFrame
 from wrappers.normalize_action_wrapper import check_and_normalize_box_actions
 
+from envs.dusty_env import DustyEnv
 import envs
 import numpy as np
 import os
@@ -76,6 +77,13 @@ def is_atari(env_name):
 def make_env(args, monitor=True):
     if 'dmc' in args.env.name:
         env = make_dcm(args)
+    elif args.env.name == "dusty":
+        print(f"🌟 Creating Custom Dusty Environment (Offline Mode)")
+        env = DustyEnv()
+        # Wrappers are usually not needed for a Mock Env, 
+        # but if your agent expects normalized float inputs (0.0-1.0),
+        # you might manually wrap it or handle it in the dataset loader.
+        return env
     else:
         env = gym.make(args.env.name)
     
@@ -84,6 +92,8 @@ def make_env(args, monitor=True):
 
     if is_atari(args.env.name):
         env = make_atari(env)
+
+    # --- ADD THIS BLOCK ---
 
     # Normalize box actions to [-1, 1]
     env = check_and_normalize_box_actions(env)

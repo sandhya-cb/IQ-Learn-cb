@@ -1,8 +1,8 @@
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 from collections import deque
-from gym import spaces
+from gymnasium import spaces
     
 class FrameStack(gym.Wrapper):
     def __init__(self, env, k):

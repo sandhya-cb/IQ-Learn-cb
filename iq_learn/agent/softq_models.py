@@ -8,6 +8,7 @@ from torch.autograd import Variable, grad
 
 class SoftQNetwork(nn.Module):
     def __init__(self, obs_dim, action_dim, args, device='cpu'):
+        print("SoftQNetwork args: ", args)
         super(SoftQNetwork, self).__init__()
         self.args = args
         self.device = device
@@ -17,10 +18,10 @@ class SoftQNetwork(nn.Module):
         return NotImplementedError
 
     def forward(self, x, both=False):
-        if "DoubleQ" in self.args.q_net._target_:
-            out = self._forward(x, both)
-        else:
-            out = self._forward(x)
+        # if "DoubleQ" in self.args.q_net._target_:
+        #     out = self._forward(x, both)
+        # else:
+        out = self._forward(x)
 
         if self.args.method.tanh:
             return self.tanh(out) * 1/(1-self.args.gamma)
@@ -87,14 +88,15 @@ class SimpleQNetwork(SoftQNetwork):
         self.fc3 = nn.Linear(128, action_dim)
 
     def _forward(self, x, *args):
-        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc1(x) )
         x = self.relu(self.fc2(x))
         x = self.fc3(x)
         return x
 
 
 class OfflineQNetwork(SoftQNetwork):
-    def __init__(self, obs_dim, action_dim, args, device='cpu'):
+    def __init__(self, obs_dim: int, action_dim: int, args:dict, device='cpu'):
+        print("OfflineQNetwork args: ", args)
         super(OfflineQNetwork, self).__init__(obs_dim, action_dim, args, device)
         self.args = args
         self.fc1 = nn.Linear(obs_dim, 64)

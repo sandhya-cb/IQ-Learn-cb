@@ -2,7 +2,7 @@ import random
 from itertools import count
 from collections import defaultdict
 
-import gym
+import gymnasium as gym
 import hydra
 import numpy as np
 import torch
@@ -61,14 +61,15 @@ def main(cfg: DictConfig):
         if saved_eps >= MAX_EPS:
             break
 
-        state = env.reset()
+        state, info = env.reset()
         episode_reward = 0
         traj = []
 
         episode_infos = None
         for time_steps in range(EPS_STEPS):
             action = agent.choose_action(state)
-            next_state, reward, done, info = env.step(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
             if is_atari(args.env.name) and isinstance(action, np.ndarray):
                 action = action.item()
 
