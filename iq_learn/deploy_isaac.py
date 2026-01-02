@@ -8,18 +8,20 @@ import omni.kit.app
 import carb
 import asyncio
 from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema
+
 # --- CONFIGURATION ---
 PROJECT_ROOT = "/home/clutterbot/lerobot/IQ-Learn/iq_learn"
-MODEL_PATH = "/home/clutterbot/lerobot/IQ-Learn/iq_learn/outputs/2025-11-27/14-19-00/policy_final.pth"
+MODEL_PATH = "/home/clutterbot/lerobot/IQ-Learn/iq_learn/outputs/policy_final.pth"
 
+# Must match Training exactly!
 ACTIVE_JOINT_NAMES = ["Left_arm", "Right_arm", "Left_palm", "Right_palm"]
-CAMERA_PRIM_PATH = "/Dusty_beta/base_link/cam0/Camera_01"
+CAMERA_PRIM_PATH = "/Dusty_beta/base_link/cam0/Camera"
+
 # ---------------------
 
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-# Force Reload to clear cached errors
 try:
     import agent.sac
     import importlib
@@ -33,9 +35,6 @@ from omni.isaac.sensor import Camera
 from agent.sac import SAC
 from pxr import UsdPhysics
 
-# ---------------------------------------------------------
-# 2. HARDCODED NETWORK CONFIGURATION
-# ---------------------------------------------------------
 DEFAULT_ACTOR_CFG = {'_target_': 'agent.sac_models.DiagGaussianActor', 'hidden_dim': 256, 'hidden_depth': 2, 'log_std_bounds': [-5, 2]}
 DEFAULT_CRITIC_CFG = {'_target_': 'agent.sac_models.DoubleQCritic', 'hidden_dim': 256, 'hidden_depth': 2}
 
@@ -51,8 +50,14 @@ class RobotController:
     async def setup(self):
         print("🚀 Initializing...")
         
-        # 1. Load Agent
-        OBS_DIM = (3, 84, 84)
+        # --- 1. Load Agent ---
+        # CRITICAL: This must match your training config EXACTLY.
+        # If you trained with state=[4], this must be 4.
+        STATE_DIM = 4 
+        OBS_DIM = {
+            'image': (3, 84, 84),
+            'state': (STATE_DIM,) 
+        }
         ACTION_DIM = 4
         
         actor_cfg = DEFAULT_ACTOR_CFG.copy()
@@ -69,9 +74,16 @@ class RobotController:
         if os.path.exists(MODEL_PATH):
             ckpt = torch.load(MODEL_PATH, map_location=self.device)
             state_dict = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
-            self.agent.actor.load_state_dict(state_dict)
-            self.agent.actor.eval()
-            print("✅ Weights loaded.")
+            
+            # Strict=False helps skip missing keys if slightly mismatched, 
+            # but usually you want Strict=True to ensure correctness.
+            try:
+                self.agent.actor.load_state_dict(state_dict, strict=True)
+                self.agent.actor.eval()
+                print("✅ Weights loaded successfully.")
+            except Exception as e:
+                carb.log_error(f"Weights Load Error: {e}")
+                return
         else:
             carb.log_error(f"Model not found at {MODEL_PATH}")
             return
@@ -80,7 +92,7 @@ class RobotController:
         World.clear_instance()
         self.world = World(stage_units_in_meters=1.0)
         
-        # 4. Find Robot (Auto-detect)
+        # 4. Find Robot
         stage = omni.usd.get_context().get_stage()
         articulations = [p.GetPath().pathString for p in stage.Traverse() if p.HasAPI(UsdPhysics.ArticulationRootAPI)]
         if not articulations:
@@ -88,27 +100,13 @@ class RobotController:
             return
         
         try:
-            # WARMUP PHYSICS before wrapping
+            # Warmup
             omni.timeline.get_timeline_interface().play()
             for _ in range(5): await omni.kit.app.get_app().next_update_async()
 
             self.robot = self.world.scene.add(Robot(prim_path=articulations[0], name="dusty"))
-            
-            # cam_prim = stage.GetPrimAtPath(CAMERA_PRIM_PATH)
-            # if cam_prim:
-            #     geom_cam = UsdGeom.Camera(cam_prim)
-            #     h_attr = geom_cam.GetHorizontalApertureAttr()
-            #     v_attr = geom_cam.GetVerticalApertureAttr()
-                
-            #     if h_attr.IsValid() and v_attr.IsValid():
-            #         width = h_attr.Get()
-            #         # Force Height == Width (Square Sensor)
-            #         v_attr.Set(width)
-            #         print(f"📷 Corrected Camera Sensor to Square: {width}x{width}")
-            # # ------------------------------------
             self.camera = Camera(prim_path=CAMERA_PRIM_PATH, resolution=(84, 84))
             self.camera.initialize()
-            
             self.robot.initialize()
             
             # Map Joints
@@ -124,98 +122,81 @@ class RobotController:
             carb.log_error(f"Setup Error: {e}")
             return
 
-        # 5. REGISTER UPDATE LOOP
+        # 5. Register Loop
         self.sub = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(
             self.on_update
         )
-        print("✅ Controller Registered. Moving Robot...")
+        print("✅ Controller Registered.")
 
     def on_update(self, event):
         if not self.world.is_playing(): return
 
         try:
-            # A. Get Obs
-            print("A")
+            # --- A. Get Image ---
             raw_data = self.camera.get_rgba()
             if raw_data is None or raw_data.size == 0: return
 
-            if raw_data.ndim == 1:
-                raw_data = raw_data.reshape((84, 84, 4))
-
+            if raw_data.ndim == 1: raw_data = raw_data.reshape((84, 84, 4))
             rgb = raw_data[:, :, :3]
-            if rgb.shape[0] != 84:
-                rgb = cv2.resize(rgb, (84, 84), interpolation=cv2.INTER_AREA)
+            if rgb.shape[0] != 84: rgb = cv2.resize(rgb, (84, 84), interpolation=cv2.INTER_AREA)
             
-            obs_numpy = np.transpose(rgb, (2, 0, 1)).astype(np.uint8)
-            if np.random.rand() < 0.05:
-                # 1. Reverse the Transpose: (3, 84, 84) -> (84, 84, 3)
-                debug_img = np.transpose(obs_numpy, (1, 2, 0))
-                
-                # 2. Convert RGB to BGR (OpenCV uses BGR)
-                debug_img = cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR)
-                
-                # 3. Blow it up so you can see it easily (84x84 is tiny)
-                debug_img_large = cv2.resize(debug_img, (256, 256), interpolation=cv2.INTER_NEAREST)
-                
-                # 4. Save to your home folder
-                save_path = os.path.join(os.path.expanduser("~"), "agent_view.png")
-                cv2.imwrite(save_path, debug_img_large)
-                print(f"📸 Saved agent view to: {save_path}")
-            # ---------------------------------------------------------
-            # B. Inference
-            print("B")
-            obs_tensor = torch.from_numpy(obs_numpy).float().to(self.device) / 255.0
-            obs_tensor = obs_tensor.unsqueeze(0) 
+            # (H, W, C) -> (C, H, W)
+            obs_numpy_img = np.transpose(rgb, (2, 0, 1)).astype(np.uint8)
 
-            with torch.no_grad():
-                action = self.agent.choose_action(obs_numpy, sample=False)
-
-            # C. Apply
-            # We use this as a base so we don't disturb wheels/plow
-            print("C")
+            # --- B. Get State ---
+            # 1. Get full pose (9 joints)
             current_full_pose = self.robot.get_joint_positions()
             
-            # 2. Identify the Plow Index (Index 3 from your logs)
-            # 'Castor_body', 'Left_arm', 'Left_drive', 'Plow_lift'(3)
-            # plow_index = 3 
+            # 2. Extract ONLY the active joints (4 joints)
+            active_state = [current_full_pose[i] for i in self.active_indices]
+            obs_numpy_state = np.array(active_state, dtype=np.float32)
 
+            # --- C. Inference (FIXED) ---
+            # We convert to Tensors MANUALLY here to avoid the "got dict" error.
+            # agent.choose_action() fails because it tries to convert the whole dict at once.
+            
+            obs_tensor_dict = {}
+            
+            # Image: (C, H, W) -> Unsqueeze Batch -> (1, C, H, W) -> Float -> GPU
+            # Note: We don't divide by 255 here because PixelEncoder handles that internally.
+            obs_tensor_dict['image'] = torch.as_tensor(obs_numpy_img, device=self.device).float().unsqueeze(0)
+            
+            # State: (Dim,) -> Unsqueeze Batch -> (1, Dim) -> Float -> GPU
+            obs_tensor_dict['state'] = torch.as_tensor(obs_numpy_state, device=self.device).float().unsqueeze(0)
 
-            # 4. Overwrite just the Arm Indices with Agent Data
-            # Map Agent Output [-1, 1] -> Radians
-            print("Target arm positions unprocessed:", action)
-            target_arm_positions = action # * 1.57
-            print("Target arm positions processed:", target_arm_positions)
+            with torch.no_grad():
+                # Call the ACTOR directly (Bypassing agent.choose_action)
+                # The actor returns a Distribution object
+                dist = self.agent.actor(obs_tensor_dict)
+                
+                # We want the deterministic mean for evaluation
+                action_tensor = dist.mean
+                
+                # Convert back to numpy: (1, 4) -> (4,)
+                action = action_tensor.cpu().numpy()[0]
+
+            # --- D. Apply Action ---
+            target_arm_positions = action 
+            
+            # Update the full pose vector
             for i, robot_idx in enumerate(self.active_indices):
                 current_full_pose[robot_idx] = target_arm_positions[i]
-            print("Current full pose: ", current_full_pose)
-            # current_full_pose = np.zeros(9) 
-
-            # Map the 4 Agent outputs to the specific Active Indices
-            # target_arm_positions has 4 values
-            # self.active_indices has 4 indices (e.g., [1, 4, 6, 8])
- 
-            # 5. Send the TOTAL command (All 9 joints)
+            
             self.robot.set_joint_positions(current_full_pose)
+            
         except Exception as e:
-            print(e)
+            print(f"Update Error: {e}")
             pass
-
+        
     def stop(self):
         if self.sub:
             self.sub = None
             print("🛑 Controller Stopped.")
 
-# Run Once logic
 if 'global_controller' in globals():
-    try:
-        globals()['global_controller'].stop()
+    try: globals()['global_controller'].stop()
     except: pass
-    del globals()['global_controller'] # Delete old object
+    del globals()['global_controller'] 
 
-# 2. Create NEW instance with updated code
 globals()['global_controller'] = RobotController()
-
-# 3. Schedule Setup
 asyncio.ensure_future(globals()['global_controller'].setup())
-
-#['Castor_body', 'Left_arm', 'Left_drive', 'Plow_lift', 'Right_arm', 'Right_drive', 'Left_palm', 'Plow_tilt', 'Right_palm']
