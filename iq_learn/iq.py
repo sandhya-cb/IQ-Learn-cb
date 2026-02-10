@@ -14,8 +14,24 @@ def iq_loss(agent, current_Q, current_v, next_v, batch):
     obs, next_obs, action, env_reward, done, is_expert = batch
 
     loss_dict = {}
+    
+    # --- HELPER: Handle Multimodal Slicing ---
+    def slice_obs(observation, mask):
+        """Slices an observation whether it's a Tensor or a Dict."""
+        if isinstance(observation, dict):
+            # If Dict: Slice each key independently {image: [...], state: [...]}
+            return {k: v[mask] for k, v in observation.items()}
+        else:
+            # If Tensor: Standard slice
+            return observation[mask]
+    # -----------------------------------------
+
     # keep track of value of initial states
-    v0 = agent.getV(obs[is_expert.squeeze(1), ...]).mean()
+    # FIX: Use helper instead of obs[is_expert.squeeze(1), ...]
+    mask = is_expert.squeeze(1)
+    expert_obs = slice_obs(obs, mask)
+    
+    v0 = agent.getV(expert_obs).mean()
     loss_dict['v0'] = v0.item()
 
     #  calculate 1st term for IQ loss
@@ -66,32 +82,22 @@ def iq_loss(agent, current_Q, current_v, next_v, batch):
         loss += v0_loss
         loss_dict['v0_loss'] = v0_loss.item()
 
-    # alternative sampling strategies for the sake of completeness but are usually suboptimal in practice
-    # elif args.method.loss == "value_policy":
-    #     # sample using only policy states
-    #     # E_(ρ)[V(s) - γV(s')]
-    #     value_loss = (current_v - y)[~is_expert].mean()
-    #     loss += value_loss
-    #     loss_dict['value_policy_loss'] = value_loss.item()
-
-    # elif args.method.loss == "value_mix":
-    #     # sample by weighted combination of expert and policy states
-    #     # E_(ρ)[Q(s,a) - γV(s')]
-    #     w = args.method.mix_coeff
-    #     value_loss = (w * (current_v - y)[is_expert] +
-    #                   (1-w) * (current_v - y)[~is_expert]).mean()
-    #     loss += value_loss
-    #     loss_dict['value_loss'] = value_loss.item()
-
     else:
         raise ValueError(f'This sampling method is not implemented: {args.method.type}')
 
     if args.method.grad_pen:
         # add a gradient penalty to loss (Wasserstein_1 metric)
-        gp_loss = agent.critic_net.grad_pen(obs[is_expert.squeeze(1), ...],
-                                            action[is_expert.squeeze(1), ...],
-                                            obs[~is_expert.squeeze(1), ...],
-                                            action[~is_expert.squeeze(1), ...],
+        # FIX: Use helper for slicing here as well
+        expert_mask = is_expert.squeeze(1)
+        policy_mask = ~expert_mask
+        
+        obs_expert = slice_obs(obs, expert_mask)
+        obs_policy = slice_obs(obs, policy_mask)
+
+        gp_loss = agent.critic_net.grad_pen(obs_expert,
+                                            action[expert_mask, ...],
+                                            obs_policy,
+                                            action[policy_mask, ...],
                                             args.method.lambda_gp)
         loss_dict['gp_loss'] = gp_loss.item()
         loss += gp_loss

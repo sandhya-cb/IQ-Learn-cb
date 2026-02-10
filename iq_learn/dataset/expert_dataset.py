@@ -48,7 +48,21 @@ class ExpertDataset(Dataset):
             if k != "lengths":
                 samples = []
                 for i in range(num_trajectories):
-                    samples.append(data[i][0::subsample_frequency])
+                    traj_element = data[i]
+                    
+                    # --- FIX START: Handle Multimodal Dictionaries ---
+                    if isinstance(traj_element, dict):
+                        # If the state/action is a dictionary (e.g. {'image': ..., 'state': ...})
+                        # we must slice each key independently.
+                        subsampled_element = {}
+                        for key, val in traj_element.items():
+                            subsampled_element[key] = val[0::subsample_frequency]
+                        samples.append(subsampled_element)
+                    else:
+                        # Standard case: It's a numpy array or tensor, slice directly
+                        samples.append(traj_element[0::subsample_frequency])
+                    # --- FIX END ---
+                    
                 self.trajectories[k] = samples
             else:
                 # Adjust the length of trajectory after subsampling
@@ -79,13 +93,33 @@ class ExpertDataset(Dataset):
     def __getitem__(self, i):
         traj_idx, i = self.get_idx[i]
 
-        states = self.trajectories["states"][traj_idx][i]
-        next_states = self.trajectories["next_states"][traj_idx][i]
+        # 1. Get the full trajectory data for this index
+        # This might be a Dict (multimodal) or an Array (standard)
+        state_container = self.trajectories["states"][traj_idx]
+        next_state_container = self.trajectories["next_states"][traj_idx]
 
-        # Rescale states and next_states to [0, 1] if are images
+        # 2. Extract the specific timestep 'i'
+        
+        # --- FIX: Handle Multimodal Dictionary ---
+        if isinstance(state_container, dict):
+            # It is a dictionary {image: [N, ...], state: [N, ...]}
+            # We construct a new dict with just the i-th element of each
+            states = {key: val[i] for key, val in state_container.items()}
+        else:
+            # It is a standard array/list
+            states = state_container[i]
+
+        if isinstance(next_state_container, dict):
+            next_states = {key: val[i] for key, val in next_state_container.items()}
+        else:
+            next_states = next_state_container[i]
+        # ----------------------------------------
+
+        # 3. Normalization (Legacy support for plain image arrays)
+        # Note: We skip this for Dicts because MultiModalEncoder handles normalization.
         if isinstance(states, np.ndarray) and states.ndim == 3:
             states = np.array(states) / 255.0
-        if isinstance(states, np.ndarray) and next_states.ndim == 3:
+        if isinstance(next_states, np.ndarray) and next_states.ndim == 3:
             next_states = np.array(next_states) / 255.0
 
         return (states,

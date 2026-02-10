@@ -3,7 +3,12 @@ import numpy as np
 import random
 import torch
 
-from wrappers.atari_wrapper import LazyFrames
+# Try/Except to prevent import errors if running in isolation
+try:
+    from wrappers.atari_wrapper import LazyFrames
+except ImportError:
+    class LazyFrames: pass # Dummy class
+
 from dataset.expert_dataset import ExpertDataset
 
 
@@ -49,24 +54,45 @@ class Memory(object):
     def get_samples(self, batch_size, device):
         batch = self.sample(batch_size, False)
 
-        batch_state, batch_next_state, batch_action, batch_reward, batch_done = zip(
-            *batch)
+        batch_state, batch_next_state, batch_action, batch_reward, batch_done = zip(*batch)
 
-        # Scale obs for atari. TODO: Use flags
-        if isinstance(batch_state[0], LazyFrames):
-            # Use lazyframes for improved memory storage (same as original DQN)
-            batch_state = np.array(batch_state) / 255.0
-        if isinstance(batch_next_state[0], LazyFrames):
-            batch_next_state = np.array(batch_next_state) / 255.0
-        batch_state = np.array(batch_state)
-        batch_next_state = np.array(batch_next_state)
-        batch_action = np.array(batch_action)
+        # --- FIX: Handle Multimodal Dictionary Inputs ---
+        # Check if the first element is a Dictionary (Multimodal case)
+        if isinstance(batch_state[0], dict):
+            # 1. Process Current State
+            state_dict = {}
+            for key in batch_state[0].keys():
+                # Stack the list of arrays for this specific key (e.g., stack all images together)
+                # [Batch, C, H, W] for images or [Batch, Dim] for state
+                stacked_val = np.stack([s[key] for s in batch_state])
+                state_dict[key] = torch.as_tensor(stacked_val, dtype=torch.float, device=device)
+            batch_state = state_dict
 
-        batch_state = torch.as_tensor(batch_state, dtype=torch.float, device=device)
-        batch_next_state = torch.as_tensor(batch_next_state, dtype=torch.float, device=device)
-        batch_action = torch.as_tensor(batch_action, dtype=torch.float, device=device)
+            # 2. Process Next State
+            next_state_dict = {}
+            for key in batch_next_state[0].keys():
+                stacked_val = np.stack([s[key] for s in batch_next_state])
+                next_state_dict[key] = torch.as_tensor(stacked_val, dtype=torch.float, device=device)
+            batch_next_state = next_state_dict
+
+        else:
+            # --- LEGACY: Standard Vector or Image Array ---
+            # Handle Atari LazyFrames scaling
+            if isinstance(batch_state[0], LazyFrames):
+                batch_state = np.array(batch_state) / 255.0
+            if isinstance(batch_next_state[0], LazyFrames):
+                batch_next_state = np.array(batch_next_state) / 255.0
+            
+            # Standard conversion
+            batch_state = torch.as_tensor(np.array(batch_state), dtype=torch.float, device=device)
+            batch_next_state = torch.as_tensor(np.array(batch_next_state), dtype=torch.float, device=device)
+        # ------------------------------------------------
+
+        # Process Actions, Rewards, Dones
+        batch_action = torch.as_tensor(np.array(batch_action), dtype=torch.float, device=device)
         if batch_action.ndim == 1:
             batch_action = batch_action.unsqueeze(1)
+            
         batch_reward = torch.as_tensor(batch_reward, dtype=torch.float, device=device).unsqueeze(1)
         batch_done = torch.as_tensor(batch_done, dtype=torch.float, device=device).unsqueeze(1)
 

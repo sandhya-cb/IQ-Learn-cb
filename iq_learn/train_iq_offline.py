@@ -111,7 +111,7 @@ def main(cfg: DictConfig):
 
         # Pure training loop
         for learn_steps in range(1, LEARN_STEPS + 1):
-            
+            # print(learn_steps)
             # CRITICAL: We pass expert_memory_replay for BOTH arguments.
             # The 'iq_update' function expects (policy_buffer, expert_buffer).
             # By passing expert data as the 'policy_buffer', we satisfy the inputs.
@@ -130,10 +130,16 @@ def main(cfg: DictConfig):
                 logger.log('train/episode', learn_steps / 1000, learn_steps) 
                 logger.dump(learn_steps, save=True)
     
-            # Evaluate
-            #if learn_steps % args.env.eval_interval == 0:
-                print(f"Saving network at {learn_steps}...")
-                save(agent, learn_steps, args, output_dir='results')
+                # Evaluate
+                if learn_steps % 10000 == 0:
+                    print(f"Saving network at {learn_steps}...")
+                    save(agent, learn_steps, args, output_dir='results')
+                        # Also save the Actor if using SAC (Crucial for inference!)
+                    if hasattr(agent, 'actor'):
+                        actor_path = f"policy_final_{learn_steps}.pth"
+                        torch.save(agent.actor.state_dict(), actor_path)
+                        print(f"✅ Policy saved to {actor_path}")
+        
                 # We don't need to optimize on it, just look at it.
                 sample_batch = expert_memory_replay.get_samples(1, device=agent.device)
                 

@@ -109,7 +109,6 @@ def mlp(input_dim, hidden_dim, output_dim, hidden_depth, output_mod=None):
 
 def get_concat_samples(policy_batch, expert_batch, args):
     online_batch_state, online_batch_next_state, online_batch_action, online_batch_reward, online_batch_done = policy_batch
-
     expert_batch_state, expert_batch_next_state, expert_batch_action, expert_batch_reward, expert_batch_done = expert_batch
 
     if args.method.type == "sqil":
@@ -118,17 +117,34 @@ def get_concat_samples(policy_batch, expert_batch, args):
         # convert expert reward to 1
         expert_batch_reward = torch.ones_like(expert_batch_reward)
 
-    batch_state = torch.cat([online_batch_state, expert_batch_state], dim=0)
-    batch_next_state = torch.cat(
-        [online_batch_next_state, expert_batch_next_state], dim=0)
+    # --- FIX START: Helper for Multimodal Concatenation ---
+    def concat_obs(obs1, obs2):
+        if isinstance(obs1, dict):
+            # Input is a dictionary {image: ..., state: ...}
+            # Concatenate each key separately
+            concatenated = {}
+            for k in obs1.keys():
+                concatenated[k] = torch.cat([obs1[k], obs2[k]], dim=0)
+            return concatenated
+        else:
+            # Standard case: simple tensor concatenation
+            return torch.cat([obs1, obs2], dim=0)
+    # --- FIX END ------------------------------------------
+
+    # Use the helper for states (handles both Dicts and Tensors)
+    batch_state = concat_obs(online_batch_state, expert_batch_state)
+    batch_next_state = concat_obs(online_batch_next_state, expert_batch_next_state)
+
+    # Standard concat for actions/rewards/dones (these are always tensors)
     batch_action = torch.cat([online_batch_action, expert_batch_action], dim=0)
     batch_reward = torch.cat([online_batch_reward, expert_batch_reward], dim=0)
     batch_done = torch.cat([online_batch_done, expert_batch_done], dim=0)
+    
+    # Create Expert Flag (0 for policy data, 1 for expert data)
     is_expert = torch.cat([torch.zeros_like(online_batch_reward, dtype=torch.bool),
                            torch.ones_like(expert_batch_reward, dtype=torch.bool)], dim=0)
 
     return batch_state, batch_next_state, batch_action, batch_reward, batch_done, is_expert
-
 
 def save_state(tensor, path, num_states=5):
     """Show stack framed of images consisting the state"""
